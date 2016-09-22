@@ -54,6 +54,13 @@
         <source-file src="src/android/FileTransfer.java" target-dir="src/org/apache/cordova/filetransfer" />
         <source-file src="src/android/FileProgressResult.java" target-dir="src/org/apache/cordova/filetransfer" />
         <source-file src="src/android/FileUploadResult.java" target-dir="src/org/apache/cordova/filetransfer" />
+
+        <source-file src="src/android/audio/CheapAAC.java" target-dir="src/org/apache/cordova/filetransfer/audio" />
+        <source-file src="src/android/audio/CheapAMR.java" target-dir="src/org/apache/cordova/filetransfer/audio" />
+        <source-file src="src/android/audio/CheapMP3.java" target-dir="src/org/apache/cordova/filetransfer/audio" />
+        <source-file src="src/android/audio/CheapSoundFile.java" target-dir="src/org/apache/cordova/filetransfer/audio" />
+        <source-file src="src/android/audio/CheapWAV.java" target-dir="src/org/apache/cordova/filetransfer/audio" />
+        <source-file src="src/android/audio/Util.java" target-dir="src/org/apache/cordova/filetransfer/audio" />
     </platform>
 
     <!-- amamzon-fireos -->
@@ -72,7 +79,7 @@
         <source-file src="src/android/FileProgressResult.java" target-dir="src/org/apache/cordova/filetransfer" />
         <source-file src="src/android/FileUploadResult.java" target-dir="src/org/apache/cordova/filetransfer" />
     </platform>
-    
+
     <!-- ubuntu -->
     <platform name="ubuntu">
         <header-file src="src/ubuntu/file-transfer.h" />

@@ -18,37 +18,14 @@
 */
 package org.apache.cordova.filetransfer;
 
-import java.io.BufferedReader;
-import java.io.ByteArrayOutputStream;
-import java.io.Closeable;
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.FilterInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
-import java.net.HttpURLConnection;
-import java.net.URLConnection;
-import java.security.cert.CertificateException;
-import java.security.cert.X509Certificate;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.zip.GZIPInputStream;
-import java.util.zip.Inflater;
+import android.net.Uri;
+import android.os.Build;
+import android.util.Log;
+import android.webkit.CookieManager;
 
-import javax.net.ssl.HostnameVerifier;
-import javax.net.ssl.HttpsURLConnection;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLSession;
-import javax.net.ssl.SSLSocketFactory;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
+import org.apache.cordova.filetransfer.audio.CheapSoundFile;
+import org.apache.cordova.filetransfer.audio.Util;
 
-import org.apache.cordova.Config;
 import org.apache.cordova.CallbackContext;
 import org.apache.cordova.CordovaPlugin;
 import org.apache.cordova.CordovaResourceApi;
@@ -62,115 +39,251 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-import android.net.Uri;
-import android.os.Build;
-import android.webkit.CookieManager;
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.FilterInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.io.UnsupportedEncodingException;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.net.HttpURLConnection;
+import java.net.URLConnection;
+import java.security.InvalidKeyException;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.Inflater;
+
+import javax.crypto.Cipher;
+import javax.crypto.CipherOutputStream;
+import javax.crypto.NoSuchPaddingException;
+import javax.crypto.spec.SecretKeySpec;
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 
 public class FileTransfer extends CordovaPlugin {
 
     private static final String LOG_TAG = "FileTransfer";
     private static final String LINE_START = "--";
     private static final String LINE_END = "\r\n";
-    private static final String BOUNDARY =  "+++++";
+    private static final String BOUNDARY = "+++++";
+    private static final int MAX_BUFFER_SIZE = 16 * 1024;
+    // always verify the host - don't check for certificate
+    private static final HostnameVerifier DO_NOT_VERIFY = new HostnameVerifier() {
+        public boolean verify(String hostname, SSLSession session) {
+            return true;
+        }
+    };
+    // Create a trust manager that does not validate certificate chains
+    private static final TrustManager[] trustAllCerts = new TrustManager[]{new X509TrustManager() {
+        public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+            return new java.security.cert.X509Certificate[]{};
+        }
 
+        public void checkClientTrusted(X509Certificate[] chain,
+                                       String authType) throws CertificateException {
+        }
+
+        public void checkServerTrusted(X509Certificate[] chain,
+                                       String authType) throws CertificateException {
+        }
+    }};
     public static int FILE_NOT_FOUND_ERR = 1;
     public static int INVALID_URL_ERR = 2;
     public static int CONNECTION_ERR = 3;
     public static int ABORTED_ERR = 4;
     public static int NOT_MODIFIED_ERR = 5;
-
     private static HashMap<String, RequestContext> activeRequests = new HashMap<String, RequestContext>();
-    private static final int MAX_BUFFER_SIZE = 16 * 1024;
 
-    private static final class RequestContext {
-        String source;
-        String target;
-        File targetFile;
-        CallbackContext callbackContext;
-        HttpURLConnection connection;
-        boolean aborted;
-        RequestContext(String source, String target, CallbackContext callbackContext) {
-            this.source = source;
-            this.target = target;
-            this.callbackContext = callbackContext;
-        }
-        void sendPluginResult(PluginResult pluginResult) {
-            synchronized (this) {
-                if (!aborted) {
-                    callbackContext.sendPluginResult(pluginResult);
+    private static void addHeadersToRequest(URLConnection connection, JSONObject headers) {
+        try {
+            for (Iterator<?> iter = headers.keys(); iter.hasNext(); ) {
+                /* RFC 2616 says that non-ASCII characters and control
+                 * characters are not allowed in header names or values.
+                 * Additionally, spaces are not allowed in header names.
+                 * RFC 2046 Quoted-printable encoding may be used to encode
+                 * arbitrary characters, but we donon- not do that encoding here.
+                 */
+                String headerKey = iter.next().toString();
+                String cleanHeaderKey = headerKey.replaceAll("\\n", "")
+                        .replaceAll("\\s+", "")
+                        .replaceAll(":", "")
+                        .replaceAll("[^\\x20-\\x7E]+", "");
+
+                JSONArray headerValues = headers.optJSONArray(headerKey);
+                if (headerValues == null) {
+                    headerValues = new JSONArray();
+
+                     /* RFC 2616 also says that any amount of consecutive linear
+                      * whitespace within a header value can be replaced with a
+                      * single space character, without affecting the meaning of
+                      * that value.
+                      */
+
+                    String headerValue = headers.getString(headerKey);
+                    String finalValue = headerValue.replaceAll("\\s+", " ").replaceAll("\\n", " ").replaceAll("[^\\x20-\\x7E]+", " ");
+                    headerValues.put(finalValue);
                 }
+
+                //Use the clean header key, not the one that we passed in
+                connection.setRequestProperty(cleanHeaderKey, headerValues.getString(0));
+                for (int i = 1; i < headerValues.length(); ++i) {
+                    connection.addRequestProperty(headerKey, headerValues.getString(i));
+                }
+            }
+        } catch (JSONException e1) {
+            // No headers to be manipulated!
+        }
+    }
+
+    private static void safeClose(Closeable stream) {
+        if (stream != null) {
+            try {
+                stream.close();
+            } catch (IOException e) {
             }
         }
     }
 
-    /**
-     * Adds an interface method to an InputStream to return the number of bytes
-     * read from the raw stream. This is used to track total progress against
-     * the HTTP Content-Length header value from the server.
-     */
-    private static abstract class TrackingInputStream extends FilterInputStream {
-      public TrackingInputStream(final InputStream in) {
-        super(in);
-      }
-        public abstract long getTotalRawBytesRead();
-  }
-
-    private static class ExposedGZIPInputStream extends GZIPInputStream {
-      public ExposedGZIPInputStream(final InputStream in) throws IOException {
-        super(in);
-      }
-      public Inflater getInflater() {
-        return inf;
-      }
-  }
+    private static TrackingInputStream getInputStream(URLConnection conn) throws IOException {
+        String encoding = conn.getContentEncoding();
+        if (encoding != null && encoding.equalsIgnoreCase("gzip")) {
+            return new TrackingGZIPInputStream(new ExposedGZIPInputStream(conn.getInputStream()));
+        }
+        return new SimpleTrackingInputStream(conn.getInputStream());
+    }
 
     /**
-     * Provides raw bytes-read tracking for a GZIP input stream. Reports the
-     * total number of compressed bytes read from the input, rather than the
-     * number of uncompressed bytes.
+     * This function will install a trust manager that will blindly trust all SSL
+     * certificates.  The reason this code is being added is to enable developers
+     * to do development using self signed SSL certificates on their web server.
+     * <p/>
+     * The standard HttpsURLConnection class will throw an exception on self
+     * signed certificates if this code is not run.
      */
-    private static class TrackingGZIPInputStream extends TrackingInputStream {
-      private ExposedGZIPInputStream gzin;
-      public TrackingGZIPInputStream(final ExposedGZIPInputStream gzin) throws IOException {
-        super(gzin);
-        this.gzin = gzin;
-      }
-      public long getTotalRawBytesRead() {
-        return gzin.getInflater().getBytesRead();
-      }
-  }
+    private static SSLSocketFactory trustAllHosts(HttpsURLConnection connection) {
+        // Install the all-trusting trust manager
+        SSLSocketFactory oldFactory = connection.getSSLSocketFactory();
+        try {
+            // Install our all trusting manager
+            SSLContext sc = SSLContext.getInstance("TLS");
+            sc.init(null, trustAllCerts, new java.security.SecureRandom());
+            SSLSocketFactory newFactory = sc.getSocketFactory();
+            connection.setSSLSocketFactory(newFactory);
+        } catch (Exception e) {
+            Log.e(LOG_TAG, e.getMessage(), e);
+        }
+        return oldFactory;
+    }
+
+    private static JSONObject createFileTransferError(int errorCode, String source, String target, URLConnection connection, Throwable throwable) {
+
+        int httpStatus = 0;
+        StringBuilder bodyBuilder = new StringBuilder();
+        String body = null;
+        if (connection != null) {
+            try {
+                if (connection instanceof HttpURLConnection) {
+                    httpStatus = ((HttpURLConnection) connection).getResponseCode();
+                    InputStream err = ((HttpURLConnection) connection).getErrorStream();
+                    if (err != null) {
+                        BufferedReader reader = new BufferedReader(new InputStreamReader(err, "UTF-8"));
+                        try {
+                            String line = reader.readLine();
+                            while (line != null) {
+                                bodyBuilder.append(line);
+                                line = reader.readLine();
+                                if (line != null) {
+                                    bodyBuilder.append('\n');
+                                }
+                            }
+                            body = bodyBuilder.toString();
+                        } finally {
+                            reader.close();
+                        }
+                    }
+                }
+                // IOException can leave connection object in a bad state, so catch all exceptions.
+            } catch (Throwable e) {
+                Log.w(LOG_TAG, "Error getting HTTP status code from connection.", e);
+            }
+        }
+
+        return createFileTransferError(errorCode, source, target, body, httpStatus, throwable);
+    }
 
     /**
-     * Provides simple total-bytes-read tracking for an existing InputStream
+     * Create an error object based on the passed in errorCode
+     *
+     * @param errorCode the error
+     * @return JSONObject containing the error
      */
-    private static class SimpleTrackingInputStream extends TrackingInputStream {
-        private long bytesRead = 0;
-        public SimpleTrackingInputStream(InputStream stream) {
-            super(stream);
+    private static JSONObject createFileTransferError(int errorCode, String source, String target, String body, Integer httpStatus, Throwable throwable) {
+        JSONObject error = null;
+        try {
+            error = new JSONObject();
+            error.put("code", errorCode);
+            error.put("source", source);
+            error.put("target", target);
+            if (body != null) {
+                error.put("body", body);
+            }
+            if (httpStatus != null) {
+                error.put("http_status", httpStatus);
+            }
+            if (throwable != null) {
+                String msg = throwable.getMessage();
+                if (msg == null || "".equals(msg)) {
+                    msg = throwable.toString();
+                }
+                error.put("exception", msg);
+            }
+        } catch (JSONException e) {
+            Log.e(LOG_TAG, e.getMessage(), e);
         }
+        return error;
+    }
 
-        private int updateBytesRead(int newBytesRead) {
-          if (newBytesRead != -1) {
-            bytesRead += newBytesRead;
-          }
-          return newBytesRead;
+    /**
+     * Convenience method to read a parameter from the list of JSON args.
+     *
+     * @param args          the args passed to the Plugin
+     * @param position      the position to retrieve the arg from
+     * @param defaultString the default to be used if the arg does not exist
+     * @return String with the retrieved value
+     */
+    private static String getArgument(JSONArray args, int position, String defaultString) {
+        String arg = defaultString;
+        if (args.length() > position) {
+            arg = args.optString(position);
+            if (arg == null || "null".equals(arg)) {
+                arg = defaultString;
+            }
         }
+        return arg;
+    }
 
-        @Override
-        public int read() throws IOException {
-            return updateBytesRead(super.read());
-        }
-
-        // Note: FilterInputStream delegates read(byte[] bytes) to the below method,
-        // so we don't override it or else double count (CB-5631).
-        @Override
-        public int read(byte[] bytes, int offset, int count) throws IOException {
-            return updateBytesRead(super.read(bytes, offset, count));
-        }
-
-        public long getTotalRawBytesRead() {
-          return bytesRead;
-        }
+    public static String removeExtension(String filename) {
+        return filename.substring(0, filename.lastIndexOf('.'));
     }
 
     @Override
@@ -194,60 +307,19 @@ public class FileTransfer extends CordovaPlugin {
         return false;
     }
 
-    private static void addHeadersToRequest(URLConnection connection, JSONObject headers) {
-        try {
-            for (Iterator<?> iter = headers.keys(); iter.hasNext(); ) {
-                /* RFC 2616 says that non-ASCII characters and control
-                 * characters are not allowed in header names or values.
-                 * Additionally, spaces are not allowed in header names.
-                 * RFC 2046 Quoted-printable encoding may be used to encode
-                 * arbitrary characters, but we donon- not do that encoding here.
-                 */
-                String headerKey = iter.next().toString();
-                String cleanHeaderKey = headerKey.replaceAll("\\n","")
-                        .replaceAll("\\s+","")
-                        .replaceAll(":", "")
-                        .replaceAll("[^\\x20-\\x7E]+", "");
-
-                JSONArray headerValues = headers.optJSONArray(headerKey);
-                if (headerValues == null) {
-                    headerValues = new JSONArray();
-
-                     /* RFC 2616 also says that any amount of consecutive linear
-                      * whitespace within a header value can be replaced with a
-                      * single space character, without affecting the meaning of
-                      * that value.
-                      */
-
-                    String headerValue = headers.getString(headerKey);
-                    String finalValue = headerValue.replaceAll("\\s+", " ").replaceAll("\\n"," ").replaceAll("[^\\x20-\\x7E]+", " ");
-                    headerValues.put(finalValue);
-                }
-
-                //Use the clean header key, not the one that we passed in
-                connection.setRequestProperty(cleanHeaderKey, headerValues.getString(0));
-                for (int i = 1; i < headerValues.length(); ++i) {
-                    connection.addRequestProperty(headerKey, headerValues.getString(i));
-                }
-            }
-        } catch (JSONException e1) {
-          // No headers to be manipulated!
-        }
-    }
-
     private String getCookies(final String target) {
         boolean gotCookie = false;
         String cookie = null;
         Class webViewClass = webView.getClass();
         try {
             Method gcmMethod = webViewClass.getMethod("getCookieManager");
-            Class iccmClass  = gcmMethod.getReturnType();
-            Method gcMethod  = iccmClass.getMethod("getCookie", String.class);
+            Class iccmClass = gcmMethod.getReturnType();
+            Method gcMethod = iccmClass.getMethod("getCookie", String.class);
 
-            cookie = (String)gcMethod.invoke(
-                        iccmClass.cast(
+            cookie = (String) gcMethod.invoke(
+                    iccmClass.cast(
                             gcmMethod.invoke(webView)
-                        ), target);
+                    ), target);
 
             gotCookie = true;
         } catch (NoSuchMethodException e) {
@@ -265,19 +337,20 @@ public class FileTransfer extends CordovaPlugin {
 
     /**
      * Uploads the specified file to the server URL provided using an HTTP multipart request.
-     * @param source        Full path of the file on the file system
-     * @param target        URL of the server to receive the file
-     * @param args          JSON Array of args
-     * @param callbackContext    callback id for optional progress reports
      *
-     * args[2] fileKey       Name of file request parameter
-     * args[3] fileName      File name to be used on server
-     * args[4] mimeType      Describes file content type
-     * args[5] params        key:value pairs of user-defined parameters
+     * @param source          Full path of the file on the file system
+     * @param target          URL of the server to receive the file
+     * @param args            JSON Array of args
+     * @param callbackContext callback id for optional progress reports
+     *                        <p/>
+     *                        args[2] fileKey       Name of file request parameter
+     *                        args[3] fileName      File name to be used on server
+     *                        args[4] mimeType      Describes file content type
+     *                        args[5] params        key:value pairs of user-defined parameters
      * @return FileUploadResult containing result of upload request
      */
     private void upload(final String source, final String target, JSONArray args, CallbackContext callbackContext) throws JSONException {
-        LOG.d(LOG_TAG, "upload " + source + " to " +  target);
+        Log.d(LOG_TAG, "upload " + source + " to " + target);
 
         // Setup the options
         final String fileKey = getArgument(args, 2, "file");
@@ -294,23 +367,27 @@ public class FileTransfer extends CordovaPlugin {
 
         final CordovaResourceApi resourceApi = webView.getResourceApi();
 
-        LOG.d(LOG_TAG, "fileKey: " + fileKey);
-        LOG.d(LOG_TAG, "fileName: " + fileName);
-        LOG.d(LOG_TAG, "mimeType: " + mimeType);
-        LOG.d(LOG_TAG, "params: " + params);
-        LOG.d(LOG_TAG, "trustEveryone: " + trustEveryone);
-        LOG.d(LOG_TAG, "chunkedMode: " + chunkedMode);
-        LOG.d(LOG_TAG, "headers: " + headers);
-        LOG.d(LOG_TAG, "objectId: " + objectId);
-        LOG.d(LOG_TAG, "httpMethod: " + httpMethod);
+        Log.d(LOG_TAG, "fileKey: " + fileKey);
+        Log.d(LOG_TAG, "fileName: " + fileName);
+        Log.d(LOG_TAG, "mimeType: " + mimeType);
+        Log.d(LOG_TAG, "params: " + params);
+        Log.d(LOG_TAG, "trustEveryone: " + trustEveryone);
+        Log.d(LOG_TAG, "chunkedMode: " + chunkedMode);
+        Log.d(LOG_TAG, "headers: " + headers);
+        Log.d(LOG_TAG, "objectId: " + objectId);
+        Log.d(LOG_TAG, "httpMethod: " + httpMethod);
 
         final Uri targetUri = resourceApi.remapUri(Uri.parse(target));
+        // Accept a path or a URI for the source.
+        Uri tmpSrc = Uri.parse(source);
+        final Uri sourceUri = resourceApi.remapUri(
+                tmpSrc.getScheme() != null ? tmpSrc : Uri.fromFile(new File(source)));
 
         int uriType = CordovaResourceApi.getUriType(targetUri);
         final boolean useHttps = uriType == CordovaResourceApi.URI_TYPE_HTTPS;
         if (uriType != CordovaResourceApi.URI_TYPE_HTTP && !useHttps) {
             JSONObject error = createFileTransferError(INVALID_URL_ERR, source, target, null, 0, null);
-            LOG.e(LOG_TAG, "Unsupported URI: " + targetUri);
+            Log.e(LOG_TAG, "Unsupported URI: " + targetUri);
             callbackContext.sendPluginResult(new PluginResult(PluginResult.Status.IO_EXCEPTION, error));
             return;
         }
@@ -325,14 +402,6 @@ public class FileTransfer extends CordovaPlugin {
                 if (context.aborted) {
                     return;
                 }
-
-                // We should call remapUri on background thread otherwise it throws
-                // IllegalStateException when trying to remap 'cdvfile://localhost/content/...' URIs
-                // via ContentFilesystem (see https://issues.apache.org/jira/browse/CB-9022)
-                Uri tmpSrc = Uri.parse(source);
-                final Uri sourceUri = resourceApi.remapUri(
-                        tmpSrc.getScheme() != null ? tmpSrc : Uri.fromFile(new File(source)));
-
                 HttpURLConnection conn = null;
                 HostnameVerifier oldHostnameVerifier = null;
                 SSLSocketFactory oldSocketFactory = null;
@@ -348,8 +417,8 @@ public class FileTransfer extends CordovaPlugin {
                     conn = resourceApi.createHttpConnection(targetUri);
                     if (useHttps && trustEveryone) {
                         // Setup the HTTPS connection class to trust everyone
-                        HttpsURLConnection https = (HttpsURLConnection)conn;
-                        oldSocketFactory  = trustAllHosts(https);
+                        HttpsURLConnection https = (HttpsURLConnection) conn;
+                        oldSocketFactory = trustAllHosts(https);
                         // Save the current hostnameVerifier
                         oldHostnameVerifier = https.getHostnameVerifier();
                         // Setup the connection not to verify hostnames
@@ -392,19 +461,18 @@ public class FileTransfer extends CordovaPlugin {
                         */
                     StringBuilder beforeData = new StringBuilder();
                     try {
-                        for (Iterator<?> iter = params.keys(); iter.hasNext();) {
+                        for (Iterator<?> iter = params.keys(); iter.hasNext(); ) {
                             Object key = iter.next();
-                            if(!String.valueOf(key).equals("headers"))
-                            {
-                              beforeData.append(LINE_START).append(BOUNDARY).append(LINE_END);
-                              beforeData.append("Content-Disposition: form-data; name=\"").append(key.toString()).append('"');
-                              beforeData.append(LINE_END).append(LINE_END);
-                              beforeData.append(params.getString(key.toString()));
-                              beforeData.append(LINE_END);
+                            if (!String.valueOf(key).equals("headers")) {
+                                beforeData.append(LINE_START).append(BOUNDARY).append(LINE_END);
+                                beforeData.append("Content-Disposition: form-data; name=\"").append(key.toString()).append('"');
+                                beforeData.append(LINE_END).append(LINE_END);
+                                beforeData.append(params.getString(key.toString()));
+                                beforeData.append(LINE_END);
                             }
                         }
                     } catch (JSONException e) {
-                        LOG.e(LOG_TAG, e.getMessage(), e);
+                        Log.e(LOG_TAG, e.getMessage(), e);
                     }
 
                     beforeData.append(LINE_START).append(BOUNDARY).append(LINE_END);
@@ -420,17 +488,17 @@ public class FileTransfer extends CordovaPlugin {
 
                     int stringLength = beforeDataBytes.length + tailParamsBytes.length;
                     if (readResult.length >= 0) {
-                        fixedLength = (int)readResult.length;
+                        fixedLength = (int) readResult.length;
                         if (multipartFormUpload)
                             fixedLength += stringLength;
                         progress.setLengthComputable(true);
                         progress.setTotal(fixedLength);
                     }
-                    LOG.d(LOG_TAG, "Content Length: " + fixedLength);
+                    Log.d(LOG_TAG, "Content Length: " + fixedLength);
                     // setFixedLengthStreamingMode causes and OutOfMemoryException on pre-Froyo devices.
                     // http://code.google.com/p/android/issues/detail?id=3164
                     // It also causes OOM if HTTPS is used, even on newer devices.
-                    boolean useChunkedMode = chunkedMode || (Build.VERSION.SDK_INT < Build.VERSION_CODES.FROYO || useHttps);
+                    boolean useChunkedMode = chunkedMode && (Build.VERSION.SDK_INT < Build.VERSION_CODES.FROYO || useHttps);
                     useChunkedMode = useChunkedMode || (fixedLength == -1);
 
                     if (useChunkedMode) {
@@ -475,7 +543,7 @@ public class FileTransfer extends CordovaPlugin {
                             sendStream.write(buffer, 0, bytesRead);
                             if (totalBytes > prevBytesRead + 102400) {
                                 prevBytesRead = totalBytes;
-                                LOG.d(LOG_TAG, "Uploaded " + totalBytes + " of " + fixedLength + " bytes");
+                                Log.d(LOG_TAG, "Uploaded " + totalBytes + " of " + fixedLength + " bytes");
                             }
                             bytesAvailable = readResult.inputStream.available();
                             bufferSize = Math.min(bytesAvailable, MAX_BUFFER_SIZE);
@@ -501,13 +569,13 @@ public class FileTransfer extends CordovaPlugin {
                     synchronized (context) {
                         context.connection = null;
                     }
-                    LOG.d(LOG_TAG, "Sent " + totalBytes + " of " + fixedLength);
+                    Log.d(LOG_TAG, "Sent " + totalBytes + " of " + fixedLength);
 
                     //------------------ read the SERVER RESPONSE
                     String responseString;
                     int responseCode = conn.getResponseCode();
-                    LOG.d(LOG_TAG, "response code: " + responseCode);
-                    LOG.d(LOG_TAG, "response headers: " + conn.getHeaderFields());
+                    Log.d(LOG_TAG, "response code: " + responseCode);
+                    Log.d(LOG_TAG, "response headers: " + conn.getHeaderFields());
                     TrackingInputStream inStream = null;
                     try {
                         inStream = getInputStream(conn);
@@ -533,8 +601,8 @@ public class FileTransfer extends CordovaPlugin {
                         safeClose(inStream);
                     }
 
-                    LOG.d(LOG_TAG, "got response from server");
-                    LOG.d(LOG_TAG, responseString.substring(0, Math.min(256, responseString.length())));
+                    Log.d(LOG_TAG, "got response from server");
+                    Log.d(LOG_TAG, responseString.substring(0, Math.min(256, responseString.length())));
 
                     // send request and retrieve response
                     result.setResponseCode(responseCode);
@@ -543,20 +611,20 @@ public class FileTransfer extends CordovaPlugin {
                     context.sendPluginResult(new PluginResult(PluginResult.Status.OK, result.toJSONObject()));
                 } catch (FileNotFoundException e) {
                     JSONObject error = createFileTransferError(FILE_NOT_FOUND_ERR, source, target, conn, e);
-                    LOG.e(LOG_TAG, error.toString(), e);
+                    Log.e(LOG_TAG, error.toString(), e);
                     context.sendPluginResult(new PluginResult(PluginResult.Status.IO_EXCEPTION, error));
                 } catch (IOException e) {
                     JSONObject error = createFileTransferError(CONNECTION_ERR, source, target, conn, e);
-                    LOG.e(LOG_TAG, error.toString(), e);
-                    LOG.e(LOG_TAG, "Failed after uploading " + totalBytes + " of " + fixedLength + " bytes.");
+                    Log.e(LOG_TAG, error.toString(), e);
+                    Log.e(LOG_TAG, "Failed after uploading " + totalBytes + " of " + fixedLength + " bytes.");
                     context.sendPluginResult(new PluginResult(PluginResult.Status.IO_EXCEPTION, error));
                 } catch (JSONException e) {
-                    LOG.e(LOG_TAG, e.getMessage(), e);
+                    Log.e(LOG_TAG, e.getMessage(), e);
                     context.sendPluginResult(new PluginResult(PluginResult.Status.JSON_EXCEPTION));
                 } catch (Throwable t) {
                     // Shouldn't happen, but will
                     JSONObject error = createFileTransferError(CONNECTION_ERR, source, target, conn, t);
-                    LOG.e(LOG_TAG, error.toString(), t);
+                    Log.e(LOG_TAG, error.toString(), t);
                     context.sendPluginResult(new PluginResult(PluginResult.Status.IO_EXCEPTION, error));
                 } finally {
                     synchronized (activeRequests) {
@@ -577,162 +645,14 @@ public class FileTransfer extends CordovaPlugin {
         });
     }
 
-    private static void safeClose(Closeable stream) {
-        if (stream != null) {
-            try {
-                stream.close();
-            } catch (IOException e) {
-            }
-        }
-    }
-
-    private static TrackingInputStream getInputStream(URLConnection conn) throws IOException {
-        String encoding = conn.getContentEncoding();
-        if (encoding != null && encoding.equalsIgnoreCase("gzip")) {
-          return new TrackingGZIPInputStream(new ExposedGZIPInputStream(conn.getInputStream()));
-        }
-        return new SimpleTrackingInputStream(conn.getInputStream());
-    }
-
-    // always verify the host - don't check for certificate
-    private static final HostnameVerifier DO_NOT_VERIFY = new HostnameVerifier() {
-        public boolean verify(String hostname, SSLSession session) {
-            return true;
-        }
-    };
-    // Create a trust manager that does not validate certificate chains
-    private static final TrustManager[] trustAllCerts = new TrustManager[] { new X509TrustManager() {
-        public java.security.cert.X509Certificate[] getAcceptedIssuers() {
-            return new java.security.cert.X509Certificate[] {};
-        }
-
-        public void checkClientTrusted(X509Certificate[] chain,
-                String authType) throws CertificateException {
-        }
-
-        public void checkServerTrusted(X509Certificate[] chain,
-                String authType) throws CertificateException {
-        }
-    } };
-
-    /**
-     * This function will install a trust manager that will blindly trust all SSL
-     * certificates.  The reason this code is being added is to enable developers
-     * to do development using self signed SSL certificates on their web server.
-     *
-     * The standard HttpsURLConnection class will throw an exception on self
-     * signed certificates if this code is not run.
-     */
-    private static SSLSocketFactory trustAllHosts(HttpsURLConnection connection) {
-        // Install the all-trusting trust manager
-        SSLSocketFactory oldFactory = connection.getSSLSocketFactory();
-        try {
-            // Install our all trusting manager
-            SSLContext sc = SSLContext.getInstance("TLS");
-            sc.init(null, trustAllCerts, new java.security.SecureRandom());
-            SSLSocketFactory newFactory = sc.getSocketFactory();
-            connection.setSSLSocketFactory(newFactory);
-        } catch (Exception e) {
-            LOG.e(LOG_TAG, e.getMessage(), e);
-        }
-        return oldFactory;
-    }
-
-    private static JSONObject createFileTransferError(int errorCode, String source, String target, URLConnection connection, Throwable throwable) {
-
-        int httpStatus = 0;
-        StringBuilder bodyBuilder = new StringBuilder();
-        String body = null;
-        if (connection != null) {
-            try {
-                if (connection instanceof HttpURLConnection) {
-                    httpStatus = ((HttpURLConnection)connection).getResponseCode();
-                    InputStream err = ((HttpURLConnection) connection).getErrorStream();
-                    if(err != null)
-                    {
-                        BufferedReader reader = new BufferedReader(new InputStreamReader(err, "UTF-8"));
-                        try {
-                            String line = reader.readLine();
-                            while(line != null) {
-                                bodyBuilder.append(line);
-                                line = reader.readLine();
-                                if(line != null) {
-                                    bodyBuilder.append('\n');
-                                }
-                            }
-                            body = bodyBuilder.toString();
-                        } finally {
-                            reader.close();
-                        }
-                    }
-                }
-            // IOException can leave connection object in a bad state, so catch all exceptions.
-            } catch (Throwable e) {
-                LOG.w(LOG_TAG, "Error getting HTTP status code from connection.", e);
-            }
-        }
-
-        return createFileTransferError(errorCode, source, target, body, httpStatus, throwable);
-    }
-
-        /**
-        * Create an error object based on the passed in errorCode
-        * @param errorCode      the error
-        * @return JSONObject containing the error
-        */
-    private static JSONObject createFileTransferError(int errorCode, String source, String target, String body, Integer httpStatus, Throwable throwable) {
-        JSONObject error = null;
-        try {
-            error = new JSONObject();
-            error.put("code", errorCode);
-            error.put("source", source);
-            error.put("target", target);
-            if(body != null)
-            {
-                error.put("body", body);
-            }
-            if (httpStatus != null) {
-                error.put("http_status", httpStatus);
-            }
-            if (throwable != null) {
-                String msg = throwable.getMessage();
-                if (msg == null || "".equals(msg)) {
-                    msg = throwable.toString();
-                }
-                error.put("exception", msg);
-            }
-        } catch (JSONException e) {
-            LOG.e(LOG_TAG, e.getMessage(), e);
-        }
-        return error;
-    }
-
-    /**
-     * Convenience method to read a parameter from the list of JSON args.
-     * @param args                      the args passed to the Plugin
-     * @param position          the position to retrieve the arg from
-     * @param defaultString the default to be used if the arg does not exist
-     * @return String with the retrieved value
-     */
-    private static String getArgument(JSONArray args, int position, String defaultString) {
-        String arg = defaultString;
-        if (args.length() > position) {
-            arg = args.optString(position);
-            if (arg == null || "null".equals(arg)) {
-                arg = defaultString;
-            }
-        }
-        return arg;
-    }
-
     /**
      * Downloads a file form a given URL and saves it to the specified directory.
      *
-     * @param source        URL of the server to receive the file
-     * @param target            Full path of the file on the file system
+     * @param source URL of the server to receive the file
+     * @param target Full path of the file on the file system
      */
     private void download(final String source, final String target, JSONArray args, CallbackContext callbackContext) throws JSONException {
-        LOG.d(LOG_TAG, "download " + source + " to " +  target);
+        Log.d(LOG_TAG, "download " + source + " to " + target);
 
         final CordovaResourceApi resourceApi = webView.getResourceApi();
 
@@ -741,12 +661,17 @@ public class FileTransfer extends CordovaPlugin {
         final JSONObject headers = args.optJSONObject(4);
 
         final Uri sourceUri = resourceApi.remapUri(Uri.parse(source));
+        // Accept a path or a URI for the source.
+        Uri tmpTarget = Uri.parse(target);
+        final Uri targetUri = resourceApi.remapUri(
+                tmpTarget.getScheme() != null ? tmpTarget : Uri.fromFile(new File(target)));
+
         int uriType = CordovaResourceApi.getUriType(sourceUri);
         final boolean useHttps = uriType == CordovaResourceApi.URI_TYPE_HTTPS;
         final boolean isLocalTransfer = !useHttps && uriType != CordovaResourceApi.URI_TYPE_HTTP;
         if (uriType == CordovaResourceApi.URI_TYPE_UNKNOWN) {
             JSONObject error = createFileTransferError(INVALID_URL_ERR, source, target, null, 0, null);
-            LOG.e(LOG_TAG, "Unsupported URI: " + sourceUri);
+            Log.e(LOG_TAG, "Unsupported URI: " + sourceUri);
             callbackContext.sendPluginResult(new PluginResult(PluginResult.Status.IO_EXCEPTION, error));
             return;
         }
@@ -763,7 +688,7 @@ public class FileTransfer extends CordovaPlugin {
         if (shouldAllowRequest == null) {
             try {
                 Method gwl = webView.getClass().getMethod("getWhitelist");
-                Whitelist whitelist = (Whitelist)gwl.invoke(webView);
+                Whitelist whitelist = (Whitelist) gwl.invoke(webView);
                 shouldAllowRequest = whitelist.isUrlWhiteListed(source);
             } catch (NoSuchMethodException e) {
             } catch (IllegalAccessException e) {
@@ -773,9 +698,9 @@ public class FileTransfer extends CordovaPlugin {
         if (shouldAllowRequest == null) {
             try {
                 Method gpm = webView.getClass().getMethod("getPluginManager");
-                PluginManager pm = (PluginManager)gpm.invoke(webView);
+                PluginManager pm = (PluginManager) gpm.invoke(webView);
                 Method san = pm.getClass().getMethod("shouldAllowRequest", String.class);
-                shouldAllowRequest = (Boolean)san.invoke(pm, source);
+                shouldAllowRequest = (Boolean) san.invoke(pm, source);
             } catch (NoSuchMethodException e) {
             } catch (IllegalAccessException e) {
             } catch (InvocationTargetException e) {
@@ -783,7 +708,7 @@ public class FileTransfer extends CordovaPlugin {
         }
 
         if (!Boolean.TRUE.equals(shouldAllowRequest)) {
-            LOG.w(LOG_TAG, "Source URL is not in white list: '" + source + "'");
+            Log.w(LOG_TAG, "Source URL is not in white list: '" + source + "'");
             JSONObject error = createFileTransferError(CONNECTION_ERR, source, target, null, 401, null);
             callbackContext.sendPluginResult(new PluginResult(PluginResult.Status.IO_EXCEPTION, error));
             return;
@@ -800,11 +725,6 @@ public class FileTransfer extends CordovaPlugin {
                 if (context.aborted) {
                     return;
                 }
-
-                // Accept a path or a URI for the source.
-                Uri tmpTarget = Uri.parse(target);
-                Uri targetUri = resourceApi.remapUri(
-                        tmpTarget.getScheme() != null ? tmpTarget : Uri.fromFile(new File(target)));
                 HttpURLConnection connection = null;
                 HostnameVerifier oldHostnameVerifier = null;
                 SSLSocketFactory oldSocketFactory = null;
@@ -814,13 +734,15 @@ public class FileTransfer extends CordovaPlugin {
                 boolean cached = false;
 
                 OutputStream outputStream = null;
+                FileOutputStream mp3out = null;
+
                 try {
                     OpenForReadResult readResult = null;
 
                     file = resourceApi.mapUriToFile(targetUri);
                     context.targetFile = file;
 
-                    LOG.d(LOG_TAG, "Download file:" + sourceUri);
+                    Log.d(LOG_TAG, "Download file:" + sourceUri);
 
                     FileProgressResult progress = new FileProgressResult();
 
@@ -837,7 +759,7 @@ public class FileTransfer extends CordovaPlugin {
                         connection = resourceApi.createHttpConnection(sourceUri);
                         if (useHttps && trustEveryone) {
                             // Setup the HTTPS connection class to trust everyone
-                            HttpsURLConnection https = (HttpsURLConnection)connection;
+                            HttpsURLConnection https = (HttpsURLConnection) connection;
                             oldSocketFactory = trustAllHosts(https);
                             // Save the current hostnameVerifier
                             oldHostnameVerifier = https.getHostnameVerifier();
@@ -850,8 +772,7 @@ public class FileTransfer extends CordovaPlugin {
                         // TODO: Make OkHttp use this CookieManager by default.
                         String cookie = getCookies(sourceUri.toString());
 
-                        if(cookie != null)
-                        {
+                        if (cookie != null) {
                             connection.setRequestProperty("cookie", cookie);
                         }
 
@@ -867,7 +788,7 @@ public class FileTransfer extends CordovaPlugin {
                         if (connection.getResponseCode() == HttpURLConnection.HTTP_NOT_MODIFIED) {
                             cached = true;
                             connection.disconnect();
-                            LOG.d(LOG_TAG, "Resource not modified: " + source);
+                            Log.d(LOG_TAG, "Resource not modified: " + source);
                             JSONObject error = createFileTransferError(NOT_MODIFIED_ERR, source, target, connection, null);
                             result = new PluginResult(PluginResult.Status.ERROR, error);
                         } else {
@@ -896,8 +817,19 @@ public class FileTransfer extends CordovaPlugin {
                             byte[] buffer = new byte[MAX_BUFFER_SIZE];
                             int bytesRead = 0;
                             outputStream = resourceApi.openOutputStream(targetUri);
-                            while ((bytesRead = inputStream.read(buffer)) > 0) {
-                                outputStream.write(buffer, 0, bytesRead);
+
+                            // Wrap the output stream
+
+                            CipherOutputStream fullCos = createCipherOs(outputStream, "password");
+                            mp3out = createShortFileMp3(file);
+                            while ((bytesRead = inputStream.read(buffer)) != -1) {
+
+                                if (source.contains(".mp3")) {
+                                    writeEncFile(fullCos, mp3out, buffer, bytesRead);
+                                } else {
+                                    outputStream.write(buffer, 0, bytesRead);
+                                }
+
                                 // Send a progress event.
                                 progress.setLoaded(inputStream.getTotalRawBytesRead());
                                 PluginResult progressResult = new PluginResult(PluginResult.Status.OK, progress.toJSONObject());
@@ -908,12 +840,13 @@ public class FileTransfer extends CordovaPlugin {
                             synchronized (context) {
                                 context.connection = null;
                             }
+
                             safeClose(inputStream);
                             safeClose(outputStream);
+
                         }
 
-                        LOG.d(LOG_TAG, "Saved file: " + target);
-
+                        Log.d(LOG_TAG, "Saved file: " + target);
 
                         // create FileEntry object
                         Class webViewClass = webView.getClass();
@@ -928,7 +861,7 @@ public class FileTransfer extends CordovaPlugin {
                         if (pm == null) {
                             try {
                                 Field pmf = webViewClass.getField("pluginManager");
-                                pm = (PluginManager)pmf.get(webView);
+                                pm = (PluginManager) pmf.get(webView);
                             } catch (NoSuchFieldException e) {
                             } catch (IllegalAccessException e) {
                             }
@@ -936,34 +869,73 @@ public class FileTransfer extends CordovaPlugin {
                         file = resourceApi.mapUriToFile(targetUri);
                         context.targetFile = file;
                         FileUtils filePlugin = (FileUtils) pm.getPlugin("File");
+
+                        final CheapSoundFile.ProgressListener listener = new CheapSoundFile.ProgressListener() {
+                            public boolean reportProgress(double frac) {
+
+                                long factor = (long) Math.pow(10, 4);
+                                frac = frac * factor;
+                                long tmp = Math.round(frac);
+                                frac = (double) tmp / factor;
+
+                                return true;
+                            }
+                        };
+
+                        if (source.contains(".mp3")) {
+                            File shortMP3 = new File(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_10.mp3");
+
+                            CheapSoundFile cheapSoundFile = CheapSoundFile.create(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_x10.mp3", listener);
+                            int mSampleRate = cheapSoundFile.getSampleRate();
+                            int mSamplesPerFrame = cheapSoundFile.getSamplesPerFrame();
+                            int startFrame = Util.secondsToFrames(0.0,mSampleRate, mSamplesPerFrame);
+                            int endFrame = Util.secondsToFrames(10.0, mSampleRate,mSamplesPerFrame);
+                            cheapSoundFile.WriteFile(shortMP3, startFrame, endFrame-startFrame);
+                            new File(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_x10.mp3").delete();
+
+                            byte[] buffer = new byte[MAX_BUFFER_SIZE];
+                            int bytesRead = 0;
+
+                            FileOutputStream fos = new FileOutputStream(
+                                    new File(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_x10.mp3")
+                            );
+                            CipherOutputStream fullCos = createCipherOs(fos, "password");
+                            FileInputStream shortMP3Is = new FileInputStream(shortMP3);
+                            while ((bytesRead = shortMP3Is.read(buffer)) != -1) {
+                                fullCos.write(buffer, 0, bytesRead);
+                            }
+
+                            shortMP3.delete();
+                        }
+
                         if (filePlugin != null) {
                             JSONObject fileEntry = filePlugin.getEntryForFile(file);
                             if (fileEntry != null) {
                                 result = new PluginResult(PluginResult.Status.OK, fileEntry);
                             } else {
                                 JSONObject error = createFileTransferError(CONNECTION_ERR, source, target, connection, null);
-                                LOG.e(LOG_TAG, "File plugin cannot represent download path");
+                                Log.e(LOG_TAG, "File plugin cannot represent download path");
                                 result = new PluginResult(PluginResult.Status.IO_EXCEPTION, error);
                             }
                         } else {
-                            LOG.e(LOG_TAG, "File plugin not found; cannot save downloaded file");
+                            Log.e(LOG_TAG, "File plugin not found; cannot save downloaded file");
                             result = new PluginResult(PluginResult.Status.ERROR, "File plugin not found; cannot save downloaded file");
                         }
                     }
                 } catch (FileNotFoundException e) {
                     JSONObject error = createFileTransferError(FILE_NOT_FOUND_ERR, source, target, connection, e);
-                    LOG.e(LOG_TAG, error.toString(), e);
+                    Log.e(LOG_TAG, error.toString(), e);
                     result = new PluginResult(PluginResult.Status.IO_EXCEPTION, error);
                 } catch (IOException e) {
                     JSONObject error = createFileTransferError(CONNECTION_ERR, source, target, connection, e);
-                    LOG.e(LOG_TAG, error.toString(), e);
+                    Log.e(LOG_TAG, error.toString(), e);
                     result = new PluginResult(PluginResult.Status.IO_EXCEPTION, error);
                 } catch (JSONException e) {
-                    LOG.e(LOG_TAG, e.getMessage(), e);
+                    Log.e(LOG_TAG, e.getMessage(), e);
                     result = new PluginResult(PluginResult.Status.JSON_EXCEPTION);
                 } catch (Throwable e) {
                     JSONObject error = createFileTransferError(CONNECTION_ERR, source, target, connection, e);
-                    LOG.e(LOG_TAG, error.toString(), e);
+                    Log.e(LOG_TAG, error.toString(), e);
                     result = new PluginResult(PluginResult.Status.IO_EXCEPTION, error);
                 } finally {
                     synchronized (activeRequests) {
@@ -982,14 +954,92 @@ public class FileTransfer extends CordovaPlugin {
                     if (result == null) {
                         result = new PluginResult(PluginResult.Status.ERROR, createFileTransferError(CONNECTION_ERR, source, target, connection, null));
                     }
+
                     // Remove incomplete download.
                     if (!cached && result.getStatus() != PluginResult.Status.OK.ordinal() && file != null) {
                         file.delete();
                     }
+
                     context.sendPluginResult(result);
                 }
             }
         });
+    }
+
+    // Cipher input files
+
+    private CipherOutputStream createCipherOs(
+            OutputStream os,
+            String passcode
+    ) {
+        String cipherType = "AES/ECB/NoPadding";
+        CipherOutputStream cos = null;
+
+        try {
+            byte[] key = passcode.getBytes("UTF-8");
+            SecretKeySpec sks = createSecretkeySpec(key);
+            Cipher enc = Cipher.getInstance(cipherType);
+            enc.init(Cipher.ENCRYPT_MODE, sks);
+            cos = new CipherOutputStream(os, enc);
+        }  catch (UnsupportedEncodingException e) {
+            LOG.d(LOG_TAG, "Can't convert passcode");
+            e.printStackTrace();
+        } catch (NoSuchPaddingException e) {
+            LOG.d(LOG_TAG, "No such padding in cipher");
+            e.printStackTrace();
+        } catch (NoSuchAlgorithmException e) {
+            LOG.d(LOG_TAG, "No such algorithm in cipher");
+            e.printStackTrace();
+        } catch (InvalidKeyException e) {
+            LOG.d(LOG_TAG, "Invalid key cipher");
+            e.printStackTrace();
+        }
+        return cos;
+    }
+
+    private FileOutputStream createShortFileMp3(File destinationFile) {
+        StringBuilder stringBuilder = new StringBuilder();
+        stringBuilder.append(destinationFile.getAbsolutePath().substring(0,
+                destinationFile.getAbsolutePath().lastIndexOf('/')))
+                .append("/")
+                .append(removeExtension(destinationFile.getName()))
+                .append("_x10.mp3");
+
+        FileOutputStream mp3out = null;
+
+        try {
+            mp3out = new FileOutputStream(stringBuilder.toString());
+        } catch (FileNotFoundException e) {
+            LOG.d(LOG_TAG, "Can't write first 10 seconds");
+            e.printStackTrace();
+        }
+
+        return mp3out;
+    }
+
+    private SecretKeySpec createSecretkeySpec(final byte[] passcode) {
+        SecretKeySpec sks =  new SecretKeySpec(passcode, "AES");
+        MessageDigest sha = null;
+        try {
+            sha = MessageDigest.getInstance("SHA-256");
+            byte[] key = sha.digest(passcode);
+            key = Arrays.copyOf(key,16);
+            sks = new SecretKeySpec(key, "AES");
+
+        } catch (NoSuchAlgorithmException e) {
+            e.printStackTrace();
+        }
+        return  sks;
+    }
+
+    private void  writeEncFile(CipherOutputStream fullCos, FileOutputStream mp3Out, byte[] buffer, int bytesRead) {
+        try {
+            fullCos.write(buffer, 0, bytesRead);
+            mp3Out.write(buffer, 0, bytesRead);
+        } catch (IOException e) {
+            LOG.d(LOG_TAG, "Error write cipher files");
+            e.printStackTrace();
+        }
     }
 
     /**
@@ -1017,12 +1067,110 @@ public class FileTransfer extends CordovaPlugin {
                             try {
                                 context.connection.disconnect();
                             } catch (Exception e) {
-                                LOG.e(LOG_TAG, "CB-8431 Catch workaround for fatal exception", e);
+                                Log.e(LOG_TAG, "CB-8431 Catch workaround for fatal exception", e);
                             }
                         }
                     }
                 }
             });
+        }
+    }
+
+    private static final class RequestContext {
+        String source;
+        String target;
+        File targetFile;
+        CallbackContext callbackContext;
+        HttpURLConnection connection;
+        boolean aborted;
+
+        RequestContext(String source, String target, CallbackContext callbackContext) {
+            this.source = source;
+            this.target = target;
+            this.callbackContext = callbackContext;
+        }
+
+        void sendPluginResult(PluginResult pluginResult) {
+            synchronized (this) {
+                if (!aborted) {
+                    callbackContext.sendPluginResult(pluginResult);
+                }
+            }
+        }
+    }
+
+    /**
+     * Adds an interface method to an InputStream to return the number of bytes
+     * read from the raw stream. This is used to track total progress against
+     * the HTTP Content-Length header value from the server.
+     */
+    private static abstract class TrackingInputStream extends FilterInputStream {
+        public TrackingInputStream(final InputStream in) {
+            super(in);
+        }
+
+        public abstract long getTotalRawBytesRead();
+    }
+
+    private static class ExposedGZIPInputStream extends GZIPInputStream {
+        public ExposedGZIPInputStream(final InputStream in) throws IOException {
+            super(in);
+        }
+
+        public Inflater getInflater() {
+            return inf;
+        }
+    }
+
+    /**
+     * Provides raw bytes-read tracking for a GZIP input stream. Reports the
+     * total number of compressed bytes read from the input, rather than the
+     * number of uncompressed bytes.
+     */
+    private static class TrackingGZIPInputStream extends TrackingInputStream {
+        private ExposedGZIPInputStream gzin;
+
+        public TrackingGZIPInputStream(final ExposedGZIPInputStream gzin) throws IOException {
+            super(gzin);
+            this.gzin = gzin;
+        }
+
+        public long getTotalRawBytesRead() {
+            return gzin.getInflater().getBytesRead();
+        }
+    }
+
+    /**
+     * Provides simple total-bytes-read tracking for an existing InputStream
+     */
+    private static class SimpleTrackingInputStream extends TrackingInputStream {
+        private long bytesRead = 0;
+
+        public SimpleTrackingInputStream(InputStream stream) {
+            super(stream);
+        }
+
+        private int updateBytesRead(int newBytesRead) {
+            if (newBytesRead != -1) {
+                bytesRead += newBytesRead;
+            }
+            return newBytesRead;
+        }
+
+        @Override
+        public int read() throws IOException {
+            return updateBytesRead(super.read());
+        }
+
+        // Note: FilterInputStream delegates read(byte[] bytes) to the below method,
+        // so we don't override it or else double count (CB-5631).
+        @Override
+        public int read(byte[] bytes, int offset, int count) throws IOException {
+            return updateBytesRead(super.read(bytes, offset, count));
+        }
+
+        public long getTotalRawBytesRead() {
+            return bytesRead;
         }
     }
 }
