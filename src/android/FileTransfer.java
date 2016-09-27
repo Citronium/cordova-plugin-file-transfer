@@ -820,7 +820,7 @@ public class FileTransfer extends CordovaPlugin {
 
                             // Wrap the output stream
 
-                            CipherOutputStream fullCos = createCipherOs(outputStream, "password");
+                            CipherOutputStream fullCos = createCipherOs(outputStream, MainActivity.class.getPackage().getName());
                             mp3out = createShortFileMp3(file);
                             while ((bytesRead = inputStream.read(buffer)) != -1) {
 
