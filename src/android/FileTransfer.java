@@ -883,21 +883,21 @@ public class FileTransfer extends CordovaPlugin {
                         };
 
                         if (source.contains(".mp3")) {
-                            File shortMP3 = new File(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_10.mp3");
+                            File shortMP3 = new File(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_10.adb");
 
-                            CheapSoundFile cheapSoundFile = CheapSoundFile.create(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_x10.mp3", listener);
+                            CheapSoundFile cheapSoundFile = CheapSoundFile.create(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_x10.adb", listener);
                             int mSampleRate = cheapSoundFile.getSampleRate();
                             int mSamplesPerFrame = cheapSoundFile.getSamplesPerFrame();
                             int startFrame = Util.secondsToFrames(0.0,mSampleRate, mSamplesPerFrame);
                             int endFrame = Util.secondsToFrames(10.0, mSampleRate,mSamplesPerFrame);
                             cheapSoundFile.WriteFile(shortMP3, startFrame, endFrame-startFrame);
-                            new File(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_x10.mp3").delete();
+                            new File(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_x10.adb").delete();
 
                             byte[] buffer = new byte[MAX_BUFFER_SIZE];
                             int bytesRead = 0;
 
                             FileOutputStream fos = new FileOutputStream(
-                                    new File(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_x10.mp3")
+                                    new File(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_x10.adb")
                             );
                             CipherOutputStream fullCos = createCipherOs(fos, "password");
                             FileInputStream shortMP3Is = new FileInputStream(shortMP3);
@@ -1003,7 +1003,7 @@ public class FileTransfer extends CordovaPlugin {
                 destinationFile.getAbsolutePath().lastIndexOf('/')))
                 .append("/")
                 .append(removeExtension(destinationFile.getName()))
-                .append("_x10.mp3");
+                .append("_x10.adb");
 
         FileOutputStream mp3out = null;
 

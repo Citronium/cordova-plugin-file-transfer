@@ -36,7 +36,7 @@ public class CheapMP3 extends CheapSoundFile {
 			}
 
 			public String[] getSupportedExtensions() {
-				return new String[] { "mp3" };
+				return new String[] { "mp3", "adb" };
 			}
 		};
 	}
