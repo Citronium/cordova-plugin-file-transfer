@@ -899,7 +899,7 @@ public class FileTransfer extends CordovaPlugin {
                             FileOutputStream fos = new FileOutputStream(
                                     new File(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_x10.adb")
                             );
-                            CipherOutputStream fullCos = createCipherOs(fos, "password");
+                            CipherOutputStream fullCos = createCipherOs(fos, "secret");
                             FileInputStream shortMP3Is = new FileInputStream(shortMP3);
                             while ((bytesRead = shortMP3Is.read(buffer)) != -1) {
                                 fullCos.write(buffer, 0, bytesRead);
