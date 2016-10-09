@@ -889,7 +889,7 @@ public class FileTransfer extends CordovaPlugin {
                             int mSampleRate = cheapSoundFile.getSampleRate();
                             int mSamplesPerFrame = cheapSoundFile.getSamplesPerFrame();
                             int startFrame = Util.secondsToFrames(0.0,mSampleRate, mSamplesPerFrame);
-                            int endFrame = Util.secondsToFrames(10.0, mSampleRate,mSamplesPerFrame);
+                            int endFrame = Util.secondsToFrames(30.0, mSampleRate,mSamplesPerFrame);
                             cheapSoundFile.WriteFile(shortMP3, startFrame, endFrame-startFrame);
                             new File(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_x10.adb").delete();
 
