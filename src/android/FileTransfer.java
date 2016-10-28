@@ -23,9 +23,6 @@ import android.os.Build;
 import android.util.Log;
 import android.webkit.CookieManager;
 
-import org.apache.cordova.filetransfer.audio.CheapSoundFile;
-import org.apache.cordova.filetransfer.audio.Util;
-
 import org.apache.cordova.CallbackContext;
 import org.apache.cordova.CordovaPlugin;
 import org.apache.cordova.CordovaResourceApi;
@@ -734,7 +731,6 @@ public class FileTransfer extends CordovaPlugin {
                 boolean cached = false;
 
                 OutputStream outputStream = null;
-                FileOutputStream mp3out = null;
 
                 try {
                     OpenForReadResult readResult = null;
@@ -815,17 +811,15 @@ public class FileTransfer extends CordovaPlugin {
 
                             // write bytes to file
                             byte[] buffer = new byte[MAX_BUFFER_SIZE];
-                            int bytesRead = 0;
+                            int bytesRead;
                             outputStream = resourceApi.openOutputStream(targetUri);
 
                             // Wrap the output stream
 
                             CipherOutputStream fullCos = createCipherOs(outputStream, "secret");
-                            mp3out = createShortFileMp3(file);
                             while ((bytesRead = inputStream.read(buffer)) != -1) {
-
                                 if (source.contains(".mp3")) {
-                                    writeEncFile(fullCos, mp3out, buffer, bytesRead);
+                                    writeEncFile(fullCos, buffer, bytesRead);
                                 } else {
                                     outputStream.write(buffer, 0, bytesRead);
                                 }
@@ -869,44 +863,6 @@ public class FileTransfer extends CordovaPlugin {
                         file = resourceApi.mapUriToFile(targetUri);
                         context.targetFile = file;
                         FileUtils filePlugin = (FileUtils) pm.getPlugin("File");
-
-                        final CheapSoundFile.ProgressListener listener = new CheapSoundFile.ProgressListener() {
-                            public boolean reportProgress(double frac) {
-
-                                long factor = (long) Math.pow(10, 4);
-                                frac = frac * factor;
-                                long tmp = Math.round(frac);
-                                frac = (double) tmp / factor;
-
-                                return true;
-                            }
-                        };
-
-                        if (source.contains(".mp3")) {
-                            File shortMP3 = new File(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_10.adb");
-
-                            CheapSoundFile cheapSoundFile = CheapSoundFile.create(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_x10.adb", listener);
-                            int mSampleRate = cheapSoundFile.getSampleRate();
-                            int mSamplesPerFrame = cheapSoundFile.getSamplesPerFrame();
-                            int startFrame = Util.secondsToFrames(0.0,mSampleRate, mSamplesPerFrame);
-                            int endFrame = Util.secondsToFrames(30.0, mSampleRate,mSamplesPerFrame);
-                            cheapSoundFile.WriteFile(shortMP3, startFrame, endFrame-startFrame);
-                            new File(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_x10.adb").delete();
-
-                            byte[] buffer = new byte[MAX_BUFFER_SIZE];
-                            int bytesRead = 0;
-
-                            FileOutputStream fos = new FileOutputStream(
-                                    new File(file.getAbsolutePath().substring(0, file.getAbsolutePath().lastIndexOf('/')) + "/" + removeExtension(file.getName()) + "_x10.adb")
-                            );
-                            CipherOutputStream fullCos = createCipherOs(fos, "secret");
-                            FileInputStream shortMP3Is = new FileInputStream(shortMP3);
-                            while ((bytesRead = shortMP3Is.read(buffer)) != -1) {
-                                fullCos.write(buffer, 0, bytesRead);
-                            }
-
-                            shortMP3.delete();
-                        }
 
                         if (filePlugin != null) {
                             JSONObject fileEntry = filePlugin.getEntryForFile(file);
@@ -997,26 +953,6 @@ public class FileTransfer extends CordovaPlugin {
         return cos;
     }
 
-    private FileOutputStream createShortFileMp3(File destinationFile) {
-        StringBuilder stringBuilder = new StringBuilder();
-        stringBuilder.append(destinationFile.getAbsolutePath().substring(0,
-                destinationFile.getAbsolutePath().lastIndexOf('/')))
-                .append("/")
-                .append(removeExtension(destinationFile.getName()))
-                .append("_x10.adb");
-
-        FileOutputStream mp3out = null;
-
-        try {
-            mp3out = new FileOutputStream(stringBuilder.toString());
-        } catch (FileNotFoundException e) {
-            LOG.d(LOG_TAG, "Can't write first 10 seconds");
-            e.printStackTrace();
-        }
-
-        return mp3out;
-    }
-
     private SecretKeySpec createSecretkeySpec(final byte[] passcode) {
         SecretKeySpec sks =  new SecretKeySpec(passcode, "AES");
         MessageDigest sha = null;
@@ -1032,10 +968,9 @@ public class FileTransfer extends CordovaPlugin {
         return  sks;
     }
 
-    private void  writeEncFile(CipherOutputStream fullCos, FileOutputStream mp3Out, byte[] buffer, int bytesRead) {
+    private void  writeEncFile(CipherOutputStream fullCos, byte[] buffer, int bytesRead) {
         try {
             fullCos.write(buffer, 0, bytesRead);
-            mp3Out.write(buffer, 0, bytesRead);
         } catch (IOException e) {
             LOG.d(LOG_TAG, "Error write cipher files");
             e.printStackTrace();
